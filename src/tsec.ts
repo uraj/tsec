@@ -47,9 +47,9 @@ function reportDiagnosticsWithSummary(diagnostics: readonly ts.Diagnostic[]):
     ts.sys.write(newLine + newLine);
 
     if (errorCount === 1) {
-      ts.sys.write(`Found 1 error.${newLine}`);
+      ts.sys.write(`Found 1 conformance violation.${newLine}`);
     } else {
-      ts.sys.write(`Found ${errorCount} errors.${newLine}`);
+      ts.sys.write(`Found ${errorCount} conformance violations.${newLine}`);
     }
   }
   return errorCount;
@@ -71,44 +71,40 @@ function getTsConfigFilePath(projectPath?: string): string {
   return tsConfigFilePath;
 }
 
-/**
- * A simple tsc wrapper that runs TSConformance checks over the source files
- * and emits code for files without conformance violations.
- */
-function main(args: string[]) {
-  let parsedConfig: ExtendedParsedCommandLine = ts.parseCommandLine(args);
-  if (parsedConfig.errors.length !== 0) {
-    // Same as tsc, do not emit colorful diagnostic texts for command line
-    // parsing errors.
-    ts.sys.write(
-        ts.formatDiagnostics(parsedConfig.errors, FORMAT_DIAGNOSTIC_HOST));
-    return 1;
+function isParsedCommandLine(p: ts.Program|ts.EmitAndSemanticDiagnosticsBuilderProgram|ts.ParsedCommandLine):
+  p is ts.ParsedCommandLine {
+  return !(p as ts.Program|ts.EmitAndSemanticDiagnosticsBuilderProgram).getCompilerOptions;
+}
+
+function isBuilderProgram(p: ts.Program|ts.EmitAndSemanticDiagnosticsBuilderProgram):
+  p is ts.EmitAndSemanticDiagnosticsBuilderProgram {
+  return !!(p as ts.EmitAndSemanticDiagnosticsBuilderProgram).getProgram;
+}
+
+function checkConformance(p: ts.Program|ts.EmitAndSemanticDiagnosticsBuilderProgram|ts.ParsedCommandLine) {
+  // As far as we can tell till TS 4.0.3, the callback never gets a chance to
+  // get an argument of type ts.ParsedCommandLine.
+  if (isParsedCommandLine(p)) {
+    throw new Error('unreachable');
   }
 
-  // If no source files are specified through command line arguments, there
-  // must be a configuration file that tells the compiler what to do. Try
-  // looking for this file and parse it.
-  if (parsedConfig.fileNames.length === 0) {
-    const tsConfigFilePath = getTsConfigFilePath(parsedConfig.options.project);
-    const parseConfigFileHost: ts.ParseConfigFileHost = {
-      ...ts.sys,
-      onUnRecoverableConfigFileDiagnostic: (diagnostic: ts.Diagnostic) => {
-        ts.sys.write(
-            ts.formatDiagnostics([diagnostic], FORMAT_DIAGNOSTIC_HOST));
-        ts.sys.exit(1);
-      }
-    };
-    parsedConfig = parseTsConfigFile(
-        tsConfigFilePath, parsedConfig.options, parseConfigFileHost);
+  let program: ts.Program;
+
+  if (isBuilderProgram(p)) {
+    program = p.getProgram();
+  } else {
+    program = p;
   }
 
-  const diagnostics = [...parsedConfig.errors];
+  const diagnostics: ts.Diagnostic[] = [];
 
   // Try locating and parsing exemption list.
   let conformanceExemptionConfig: ExemptionList = new Map();
-  if (parsedConfig.conformanceExemptionPath) {
+  const compilerOptions = program.getCompilerOptions();
+  const conformanceExemptionPath = compilerOptions['conformanceExemptionPath']; 
+  if (typeof conformanceExemptionPath === 'string') {
     const conformanceExemptionOrErrors =
-        parseConformanceExemptionConfig(parsedConfig.conformanceExemptionPath);
+        parseConformanceExemptionConfig(conformanceExemptionPath);
 
     if (Array.isArray(conformanceExemptionOrErrors)) {
       diagnostics.push(...conformanceExemptionOrErrors);
@@ -116,13 +112,6 @@ function main(args: string[]) {
       conformanceExemptionConfig = conformanceExemptionOrErrors;
     }
   }
-
-  const compilerHost = ts.createCompilerHost(parsedConfig.options, true);
-
-  const program = ts.createProgram(
-      parsedConfig.fileNames, parsedConfig.options, compilerHost);
-
-  diagnostics.push(...ts.getPreEmitDiagnostics(program));
 
   // Create all enabled rules with corresponding exemption list entries.
   const conformanceChecker = new Checker(program);
@@ -152,7 +141,7 @@ function main(args: string[]) {
 
   // If there are conformance errors while noEmitOnError is set, refrain from
   // emitting code.
-  if (diagnostics.length !== 0 && parsedConfig.options.noEmitOnError === true) {
+  if (diagnostics.length !== 0 && compilerOptions.noEmitOnError === true) {
     // We have to override this flag because conformance errors are not visible
     // to the actual compiler. Without `noEmit` being set, the compiler will
     // emit JS code if no other errors are found, even though we already know
@@ -163,9 +152,42 @@ function main(args: string[]) {
   const result = program.emit();
   diagnostics.push(...result.diagnostics);
 
-  const errorCount = reportDiagnosticsWithSummary(diagnostics);
-
-  return errorCount === 0 ? 0 : 1;
+  reportDiagnosticsWithSummary(diagnostics);
 }
 
-process.exitCode = main(process.argv.slice(2));
+function overrideCompilerOptions() {
+  const compilerOptionDeclarations = (ts as any).optionDeclarations;
+  if (!Array.isArray(compilerOptionDeclarations)) {
+    throw new Error('Cannot access compiler option declarations');
+  }
+  compilerOptionDeclarations.push({
+    name: "conformanceExemptionPath",
+    type: "string",
+    isFilePath: true,
+    isTsConfigOnly: true,
+    // These values are internally defined by TypeScript compiler and may change
+    // over version updates.
+    paramType: {
+      code: 6035,
+      category: ts.DiagnosticCategory.Message,
+      key: 'FILE_6035',
+      message: 'FILE',
+    },
+    category: {
+      code: 6178,
+      category: ts.DiagnosticCategory.Message,
+      key: 'Advanced_Options_6178',
+      message: 'Advanced Options',
+    },
+    description: {
+      code: 22000,
+      category: ts.DiagnosticCategory.Message,
+      key: 'Path_to_the_configuration_file_of_conformance_exemptions_22000',
+      message: 'Path to the configuration file of conformance exemptions.',
+    },
+  });
+}
+
+overrideCompilerOptions();
+
+ts.executeCommandLine(ts.sys, checkConformance, ts.sys.args);

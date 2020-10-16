@@ -10,10 +10,8 @@
   },
   "author": "Google ISE Hardening Team",
   "license": "Apache-2.0",
-  "devDependencies": {
-    "typescript": "^3.9.2"
-  },
   "dependencies": {
-    "@types/node": "^13.13.5"
+    "@types/node": "^13.13.5",
+    "typescript": "uraj/TypeScript#tsec"
   }
 }
